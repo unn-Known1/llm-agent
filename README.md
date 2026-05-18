@@ -91,7 +91,7 @@ llm-agent
 | `diff` | Show differences between files |
 | `file_type` | Detect MIME type |
 | `file_permissions` | Get/set file permissions |
-| `run_command` | Execute shell commands |
+| `run_command` | Execute shell commands (restricted to 59 safe commands) |
 
 ## Command Reference
 
@@ -101,9 +101,9 @@ llm-agent [task] [flags]
 Flags:
   --root, -r <path>         Set sandbox root directory
   --model, -m <model>       Override active model
-  --api-key <key>           Override API key
+  --api-key <key>           Override API key (or set FILE_AGENT_API_KEY env var)
   --api-url <url>           Override base URL
-  --max-iter, -n <n>        Max iterations (default: 30)
+  --max-iter, -n <n>        Max iterations (default: 100)
   --read-only               Disable write operations
   --dry-run                 Simulate writes without executing
   --no-stream               Disable token streaming
@@ -152,7 +152,7 @@ The agent maintains full conversation history across turns, giving the model com
 
 ```
 ────────────────────────────────────────────────────────────
-  File Agent v1.0.0  profile: First
+  File Agent v1.1.0  profile: First
 ────────────────────────────────────────────────────────────
   Root    /content/llm-agent
   Model   google/gemma-3n-e4b-it
@@ -170,11 +170,11 @@ The agent maintains full conversation history across turns, giving the model com
   [  [ 7/1000] ✓ grep(pattern, path)  → 1 entries  (2168ms)
   [  [ 8/1000] ✓ grep(pattern, path)  → 1 entries  (2077ms)
   [  [ 9/1000] ✓ done(summary)  (2492ms)
-  [--------------] 9/1000  ok9  err0  ms22604  22.6s  [▄▇▅█▅▅▅▆]  
+  [████████████████▁▁▁▁▁▁▁▁▁▁▁▁] 9/1000  ok9  err0  22.6s  [▄ ▇ ▅ █ ▅ ▅ ▅ ▆]  
 ────────────────────────────────────────────────────────────
   SUCCESS after 9 iteration(s)
   Summary  Completed analysis: Found TODO, FIXME, and XXX comments in the codebase.
-  Stats  ok9  err0  ms22604  22.6s
+  Stats  ok9  err0  22.6s
 ────────────────────────────────────────────────────────────
 ```
 
