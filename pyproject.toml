@@ -37,3 +37,4 @@ Issues = "https://github.com/unn-Known1/llm-agent/issues"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["llm_agent*"]
+namespaces = false
