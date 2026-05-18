@@ -1849,12 +1849,7 @@ class _LiveStats:
 
     def render_line(self, current: int) -> str:
         bar = self._bar(current)
-        nc  = f"  {_yellow('○')} {self.no_call_warns}" if self.no_call_warns else ""
-        return (
-            f"  {bar} {self.elapsed():.1f}s  "
-            f"{_green('ok')} {self.tools_ok}  "
-            f"{_red('err')} {self.tools_err}{nc}"
-        )
+        return f"  {bar} {current}/{self.max_iter}  {_grey(f'{self.elapsed():.1f}s')}"
 
     def render_footer(self, current: int) -> str:
         bar  = self._bar(current)
@@ -1993,12 +1988,10 @@ def _print_summary(result: AgentResult, stats: _LiveStats) -> None:
         print(f"  {_grey('Summary')}  {result.summary}", file=sys.stderr)
     nc = f"  {_yellow('○')} {stats.no_call_warns}" if stats.no_call_warns else ""
     print(
-        f"  {_grey('Stats')}    {_green('ok')} {stats.tools_ok}  "
-        f"{_red('err')} {stats.tools_err}{nc}  "
-        f"elapsed {stats.elapsed():.1f}s",
+        f"  {_grey('Stats')}  ok{stats.tools_ok}  err{stats.tools_err}{nc}  "
+        f"ms{stats.total_ms}  {stats.elapsed():.1f}s",
         file=sys.stderr,
     )
-    print(f"\n{stats.render_footer(result.iterations)}\n", file=sys.stderr)
     print(sep, file=sys.stderr)
 
 
