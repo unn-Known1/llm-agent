@@ -1490,11 +1490,22 @@ Find and understand:
   2. read_file() on each to understand structure
   3. search("function_name") across matches
 
+Quick code overview (FAST):
+  1. grep("^(class |def |async def )", path=".") → list all classes/functions
+  2. grep("import |from .* import", path=".") → find all imports
+  3. run_command("wc -l *.py") → get file sizes at a glance
+
 Analyze before modifying:
   1. grep("function_name") to find all files containing it
   2. count_matches("pattern") to see how many occurrences
-  3. read_file() to examine specific files
+  3. read_file() to examine specific files (use line ranges)
   4. replace_in_file() with count=N to replace specific matches
+
+Understand new codebase:
+  1. tree(".", max_depth=2) → get overview
+  2. grep("^(class |def |async def )", path=".") → find all definitions
+  3. grep("TODO|FIXME|XXX", path=".") → find notes
+  4. read_file() specific files only as needed
 
 Run tests/builds:
   1. run_command("pytest") to run tests
@@ -1507,8 +1518,18 @@ Fix permissions:
   2. file_permissions("script.sh", "755") to make executable
 
 ═══════════════════════════════════════════════════════════════
-IMPORTANT REMINDERS
+EFFICIENCY GUIDELINES (follow these for faster results)
+══════════════════════════════════════════════════════════════
+• Use grep/glob for code exploration instead of reading entire files
+• Pattern: For understanding codebase → grep("^(class |def |async def )", path=".")
+• Pattern: For finding files with patterns → glob("**/*.py") then grep on specific files
+• Avoid sequential chunked reads — use search/grep for overview first
+• Batch related operations: use run_command("grep -r 'pattern' .") instead of multiple reads
+• Re-read files only if content changed; avoid redundant reads for same data
+
 ═══════════════════════════════════════════════════════════════
+IMPORTANT REMINDERS
+══════════════════════════════════════════════════════════════
 • ALWAYS start by exploring with list_dir or tree before diving into files.
 • Use line ranges in read_file to avoid overwhelming output.
 • For edit_file: include surrounding context in old_string to ensure uniqueness.
