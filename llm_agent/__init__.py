@@ -1931,6 +1931,14 @@ class _LiveStats:
         )
 
 
+class _LineTracker:
+    __slots__ = ("lines",)
+    def __init__(self) -> None:
+        self.lines = 0
+    def reset(self) -> None:
+        self.lines = 0
+
+
 _TOOL_STRIP_RE = re.compile(r"```(?:tool|tool_call|tool_use)\s*\n.*?\n```", re.DOTALL | re.IGNORECASE)
 
 
@@ -1938,16 +1946,19 @@ def _strip_tool_blocks(text: str) -> str:
     return _TOOL_STRIP_RE.sub("", text or "").strip()
 
 
-def _make_stream_callback() -> Callable[[str], None]:
+def _make_stream_callback(tracker: _LineTracker) -> Callable[[str], None]:
     sys.stderr.write(_grey("\n  "))
+    tracker.lines += 1
     sys.stderr.flush()
     def _stream(token: str) -> None:
         sys.stderr.write(token)
+        tracker.lines += token.count("\n")
         sys.stderr.flush()
     return _stream
 
 
-def _make_step_reporter(stats: _LiveStats, max_iter: int) -> Callable[[AgentStep], None]:
+def _make_step_reporter(stats: _LiveStats, max_iter: int,
+                         tracker: _LineTracker) -> Callable[[AgentStep], None]:
     first = True
 
     def _emit(step: AgentStep) -> None:
@@ -1985,9 +1996,13 @@ def _make_step_reporter(stats: _LiveStats, max_iter: int) -> Callable[[AgentStep
 
         counter = _bold(f"[{step.iteration:>2}/{max_iter}]")
 
-        if not first:
+        if first:
+            first = False
+        elif tracker.lines > 0:
+            sys.stderr.write(f"\033[{tracker.lines}A\033[J")
+            tracker.reset()
+        else:
             sys.stderr.write("\r\033[K")
-        first = False
 
         print(
             f"  {counter} {marker} {name}({', '.join(arg_keys)}){hint}{t}{detail}"
@@ -2444,10 +2459,11 @@ def _main() -> int:
         stats    = _LiveStats(max_iter, context_window=_model_context_window(client.model),
                               show_stats=not args.no_stats,
                               show_thoughts=args.show_thoughts)
-        callback = None if args.quiet else _make_step_reporter(stats, max_iter)
+        tracker  = _LineTracker()
+        callback = None if args.quiet else _make_step_reporter(stats, max_iter, tracker)
         stream_cb = None
         if not args.no_stream and not args.quiet:
-            stream_cb = _make_stream_callback()
+            stream_cb = _make_stream_callback(tracker)
 
         try:
             result = asyncio.run(agent.run(task, on_step=callback, stream_callback=stream_cb))
