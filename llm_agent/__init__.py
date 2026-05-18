@@ -1825,12 +1825,29 @@ def _fmt_bytes(n: int) -> str:
 # Live stats / step reporter
 # ---------------------------------------------------------------------------
 
-class _LiveStats:
-    SPARK_CHARS = " ░▒▓█"
+def _model_context_window(model: str) -> int:
+    m = model.lower()
+    if "gemma" in m:         return 8192
+    if "gpt-4" in m:         return 128000
+    if "gpt-3" in m:         return 16384
+    if "claude" in m:        return 200000
+    if "deepseek" in m:      return 128000
+    if "llama" in m:         return 8192
+    if "mistral" in m:       return 32768
+    if "qwen" in m:          return 32768
+    if "mixtral" in m:       return 32768
+    if "command" in m:       return 128000
+    return 0
 
-    def __init__(self, max_iter: int, *, show_stats: bool = True,
+
+class _LiveStats:
+    SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+    def __init__(self, max_iter: int, context_window: int = 0, *,
+                 show_stats: bool = True,
                  show_thoughts: bool = False) -> None:
         self.max_iter      = max_iter
+        self.context_window = context_window
         self.show_stats    = show_stats
         self.show_thoughts = show_thoughts
         self.t_start       = time.time()
@@ -1874,10 +1891,10 @@ class _LiveStats:
     def _sparkline(self, values: list[int], width: int = 8) -> str:
         recent = values[-width:]
         if not recent:
-            return _grey("[       ]")
+            return _grey("[▁▁▁▁▁▁▁▁]")
         mx = max(recent)
         if mx == 0:
-            return _grey("[       ]")
+            return _grey("[▁▁▁▁▁▁▁▁]")
         n = len(self.SPARK_CHARS) - 1
         out = _grey("[")
         for v in recent:
@@ -1886,21 +1903,28 @@ class _LiveStats:
             out += _green(c) if idx > n // 2 else (_yellow(c) if idx > 0 else _grey(c))
         pad = width - len(recent)
         if pad > 0:
-            out += _grey(" " * pad)
+            out += _grey("▁" * pad)
         out += _grey("]")
         return out
+
+    def _fmt_tokens(self) -> str:
+        if self.total_tokens == 0:
+            return ""
+        if self.context_window:
+            cw = f"{self.context_window//1000}K" if self.context_window >= 1000 else str(self.context_window)
+            return f"  t{self.total_tokens}/{cw}"
+        return f"  t{self.total_tokens}"
 
     def render_footer(self, current: int) -> str:
         bar = self._bar(current)
         nc = f" ○{self.no_call_warns}" if self.no_call_warns else ""
-        t = f"  tok{self.total_tokens}" if self.total_tokens else ""
         spark = self._sparkline(self.iter_durations)
         es = f"{self.elapsed():.1f}s"
         return (
             f"  {bar} {current}/{self.max_iter}"
             f"  ok{self.tools_ok}  err{self.tools_err}{nc}"
             f"  ms{self.total_ms}"
-            f"{t}"
+            f"{self._fmt_tokens()}"
             f"  {_grey(es)}"
             f"  {spark}"
             "  "
@@ -2041,10 +2065,9 @@ def _print_summary(result: AgentResult, stats: _LiveStats) -> None:
     if result.summary:
         print(f"  {_grey('Summary')}  {result.summary}", file=sys.stderr)
     nc = f"  ○{stats.no_call_warns}" if stats.no_call_warns else ""
-    t = f"  tok{stats.total_tokens}" if stats.total_tokens else ""
     print(
         f"  {_grey('Stats')}  ok{stats.tools_ok}  err{stats.tools_err}{nc}"
-        f"  ms{stats.total_ms}{t}  {stats.elapsed():.1f}s",
+        f"  ms{stats.total_ms}{stats._fmt_tokens()}  {stats.elapsed():.1f}s",
         file=sys.stderr,
     )
     print(sep, file=sys.stderr)
@@ -2418,7 +2441,8 @@ def _main() -> int:
         _append_history(task)
         cfg.last_sandbox_root = root
 
-        stats    = _LiveStats(max_iter, show_stats=not args.no_stats,
+        stats    = _LiveStats(max_iter, context_window=_model_context_window(client.model),
+                              show_stats=not args.no_stats,
                               show_thoughts=args.show_thoughts)
         callback = None if args.quiet else _make_step_reporter(stats, max_iter)
         stream_cb = None
