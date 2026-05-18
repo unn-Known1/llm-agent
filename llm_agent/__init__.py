@@ -15,18 +15,33 @@ import json
 import logging
 import os
 import re
+import getpass
+import platform
+import shlex
 import shutil
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from difflib import unified_diff
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Generator, Optional
 
 log = logging.getLogger(__name__)
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+MAX_COMMAND_OUTPUT  = 5000
+MAX_TASK_PREVIEW    = 200
+MAX_LINE_PREVIEW    = 200
+MAX_ERROR_PREVIEW   = 300
+MAX_PARSE_RAW_PREVIEW = 300
+MAX_ITER_PREVIEW    = 160
+MAX_HIST_PREVIEW    = 100
+MAX_REPEAT_PREVIEW  = 80
 
 
 def _configure_logging(level: str) -> None:
@@ -89,6 +104,7 @@ class ConfigManager:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
+            CONFIG_FILE.chmod(0o600)
         except OSError as e:
             log.warning("Could not save config: %s", e)
 
@@ -203,6 +219,9 @@ PRESET_URLS: dict[str, tuple[str, str]] = {
 
 def _prompt_inline(label: str, default: str = "", secret: bool = False) -> str:
     suffix = f" [{default}]" if default else ""
+    if secret:
+        val = getpass.getpass(f"  {_cyan(label)}{_grey(suffix)}: ")
+        return val.strip() if val.strip() else default
     sys.stderr.write(f"  {_cyan(label)}{_grey(suffix)}: ")
     sys.stderr.flush()
     try:
@@ -280,6 +299,19 @@ class Sandbox:
         ".db", ".sqlite", ".mdb",
         ".pyc", ".pyo", ".pyd",
     }
+    ALLOWED_COMMANDS = frozenset({
+        "pytest", "npm", "npx", "node", "git", "ls", "cat", "wc",
+        "grep", "egrep", "fgrep", "rg", "find", "make", "cmake",
+        "gcc", "g++", "clang", "clang++", "python", "python3",
+        "cargo", "go", "rustc", "javac", "java",
+        "mkdir", "cp", "mv", "echo", "head", "tail",
+        "sort", "uniq", "cut", "tr", "sed", "awk",
+        "diff", "patch", "chmod",
+        "pip", "pip3", "curl", "wget",
+        "tar", "gzip", "gunzip", "unzip", "bzip2", "xz",
+        "which", "file", "du", "df", "env", "printenv",
+        "tee", "touch",
+    })
     DANGEROUS_ROOTS = {Path("/"), Path("/home"), Path("/Users"), Path("/tmp")}
 
     def __init__(self, root: str | Path, *,
@@ -295,7 +327,12 @@ class Sandbox:
         self._writes: list[dict] = []
 
     def _resolve(self, path: str, must_exist: bool = False) -> Path:
-        p = (self.root / path.lstrip("/")).resolve()
+        raw = (self.root / path.lstrip("/"))
+        if raw.exists() and raw.is_symlink():
+            target = raw.resolve()
+            if not str(target).startswith(str(self.root)):
+                raise SandboxError(f"symlink escapes sandbox: {path}")
+        p = raw.resolve()
         if not str(p).startswith(str(self.root)):
             raise SandboxError(f"path outside sandbox: {path}")
         if must_exist and not p.exists():
@@ -311,6 +348,22 @@ class Sandbox:
 
     def writes_audit(self) -> list[dict]:
         return list(self._writes)
+
+    def _walk_text_files(self, base: Path) -> Generator[tuple[str, str], None, None]:
+        root_str = str(self.root)
+        if base.is_file():
+            if base.suffix.lower() not in self.BINARY_EXTS:
+                rel = os.path.relpath(str(base), root_str).replace(os.sep, "/")
+                yield str(base), rel
+            return
+        for dirpath, dirnames, filenames in os.walk(str(base)):
+            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
+            for fname in filenames:
+                if os.path.splitext(fname)[1].lower() in self.BINARY_EXTS:
+                    continue
+                full = os.path.join(dirpath, fname)
+                rel  = os.path.relpath(full, root_str).replace(os.sep, "/")
+                yield full, rel
 
     # ---- read tools ----
 
@@ -375,7 +428,6 @@ class Sandbox:
                         slice_lines.append(line.rstrip("\n"))
                     elif i > end_line_arg:
                         total += sum(1 for _ in fh)
-                        break
         except UnicodeDecodeError:
             raise SandboxError(f"file is not valid UTF-8: {path}")
         except OSError as e:
@@ -417,8 +469,6 @@ class Sandbox:
         max_results = max(1, min(int(max_results) if str(max_results).isdigit() else 100, 500))
         base = self._resolve(path, must_exist=True)
         hits: list[dict] = []
-        root_str   = str(self.root)
-        binary_exts = self.BINARY_EXTS
         max_bytes   = self.MAX_READ_BYTES
 
         def _scan(full: str, rel: str) -> bool:
@@ -428,27 +478,16 @@ class Sandbox:
                 with open(full, "r", encoding="utf-8", errors="ignore") as fh:
                     for i, line in enumerate(fh, 1):
                         if rx.search(line):
-                            hits.append({"path": rel, "line": i, "text": line.rstrip("\n")[:200]})
+                            hits.append({"path": rel, "line": i, "text": line.rstrip("\n")[:MAX_LINE_PREVIEW]})
                             if len(hits) >= max_results:
                                 return True
             except OSError:
                 pass
             return False
 
-        if base.is_file():
-            rel = os.path.relpath(str(base), root_str).replace(os.sep, "/")
-            if base.suffix.lower() not in binary_exts:
-                _scan(str(base), rel)
-        else:
-            for dirpath, dirnames, filenames in os.walk(str(base)):
-                dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
-                for fname in filenames:
-                    if fname.rfind(".") != -1 and fname[fname.rfind("."):].lower() in binary_exts:
-                        continue
-                    full = os.path.join(dirpath, fname)
-                    rel  = os.path.relpath(full, root_str).replace(os.sep, "/")
-                    if _scan(full, rel):
-                        return {"pattern": pattern, "hits": hits, "count": len(hits), "truncated": True}
+        for full, rel in self._walk_text_files(base):
+            if _scan(full, rel):
+                return {"pattern": pattern, "hits": hits, "count": len(hits), "truncated": True}
         return {"pattern": pattern, "hits": hits, "count": len(hits), "truncated": len(hits) >= max_results}
 
     def file_info(self, path: str) -> dict:
@@ -528,9 +567,9 @@ class Sandbox:
         try:
             with open(full, "r", encoding="utf-8", errors="replace") as fh:
                 for i, line in enumerate(fh, 1):
-                    if i > lines:
-                        break
                     out.append(line.rstrip("\n"))
+                    if i >= lines:
+                        break
         except OSError as e:
             raise SandboxError(f"cannot read file: {e}")
         return {"path": path, "lines": len(out), "content": "\n".join(out)}
@@ -632,23 +671,17 @@ class Sandbox:
             max_results = 100
         base = self._resolve(path, must_exist=True)
         matches: list[str] = []
-        root_str = str(self.root)
-        for dirpath, dirnames, filenames in os.walk(str(base)):
-            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
-            for fname in filenames:
-                if fname.rfind(".") != -1 and fname[fname.rfind("."):].lower() in self.BINARY_EXTS:
-                    continue
-                full = os.path.join(dirpath, fname)
-                try:
-                    with open(full, "r", encoding="utf-8", errors="ignore") as fh:
-                        content = fh.read()
-                    if rx.search(content):
-                        rel = os.path.relpath(full, root_str).replace(os.sep, "/")
-                        matches.append(rel)
-                        if len(matches) >= max_results:
-                            return {"pattern": pattern, "matches": matches, "count": len(matches), "truncated": True}
-                except OSError:
-                    continue
+        for full, rel in self._walk_text_files(base):
+            try:
+                with open(full, "r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        if rx.search(line):
+                            matches.append(rel)
+                            if len(matches) >= max_results:
+                                return {"pattern": pattern, "matches": matches, "count": len(matches), "truncated": True}
+                            break
+            except OSError:
+                continue
         return {"pattern": pattern, "matches": matches, "count": len(matches), "truncated": False}
 
     def count_matches(self, path: str, pattern: str) -> dict:
@@ -682,10 +715,12 @@ class Sandbox:
         if not mode:
             return {"path": path, "mode": current_mode, "changed": False}
         self._check_write()
+        new_mode = None
         try:
             if mode.startswith("0"):
                 new_mode = int(mode, 8)
-            if mode.startswith("-"):
+            elif mode.startswith(("-", "+")):
+                op = mode[0]
                 change = mode[1:]
                 who_map = {"u": 0o700, "g": 0o070, "o": 0o007, "a": 0o777}
                 mask = 0o777
@@ -702,10 +737,13 @@ class Sandbox:
                     for c in change:
                         if c == "+":
                             continue
-                        perms = {"r": 4, "w": 2, "x": 1}
+                        perms = {"r": 0o444, "w": 0o222, "x": 0o111}
                         bit = perms.get(c)
-                        if bit:
-                            new_mode = (cur | bit) & mask
+                        if bit is not None:
+                            if op == "-":
+                                new_mode = (cur & ~bit) & mask
+                            else:
+                                new_mode = (cur | bit) & mask
                         else:
                             new_mode = None
                             break
@@ -740,8 +778,12 @@ class Sandbox:
 
     def run_command(self, cmd: str, cwd: str = ".", timeout: int = 30) -> dict:
         self._check_write()
-        import subprocess
-        import platform
+        base_cmd = shlex.split(cmd)[0] if cmd.strip() else ""
+        if base_cmd and base_cmd not in self.ALLOWED_COMMANDS:
+            allowed_show = ", ".join(sorted(self.ALLOWED_COMMANDS))
+            raise SandboxError(
+                f"command '{base_cmd}' not in allowlist. Allowed: {allowed_show}"
+            )
         try:
             timeout = max(1, min(int(timeout), 300))
         except (TypeError, ValueError):
@@ -760,8 +802,8 @@ class Sandbox:
             return {
                 "cmd": cmd, "cwd": str(full_cwd),
                 "returncode": result.returncode,
-                "stdout": result.stdout[:5000],
-                "stderr": result.stderr[:5000],
+                "stdout": result.stdout[:MAX_COMMAND_OUTPUT],
+                "stderr": result.stderr[:MAX_COMMAND_OUTPUT],
                 "ok": result.returncode == 0,
                 "platform": system,
             }
@@ -1110,84 +1152,96 @@ class LLMClient:
 
         url     = f"{self.base_url}/chat/completions"
         timeout = self.timeout
+        import random
 
-        if stream_callback:
-            return await self._streaming_complete(url, payload, headers, timeout, stream_callback)
+        max_retries = 3
+        retry_statuses = {429, 500, 502, 503}
 
+        for attempt in range(max_retries):
+            try:
+                if stream_callback:
+                    return await self._streaming_complete(url, payload, headers, timeout, stream_callback)
+
+                def _blocking() -> LLMResponse:
+                    data = json.dumps(payload).encode("utf-8")
+                    req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
+                    try:
+                        with urllib.request.urlopen(req, timeout=timeout) as resp:
+                            result = json.loads(resp.read().decode("utf-8"))
+                    except urllib.error.HTTPError as e:
+                        body = e.read().decode("utf-8", errors="replace")
+                        try:
+                            err = json.loads(body).get("error", {})
+                            msg = err.get("message", str(e)) if isinstance(err, dict) else str(e)
+                        except Exception:
+                            msg = f"HTTP {e.code}: {body[:MAX_ERROR_PREVIEW]}"
+                        raise LLMError(msg)
+                    except Exception as e:
+                        raise LLMError(f"Request failed: {e}")
+
+                    if "error" in result:
+                        err = result["error"]
+                        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                        raise LLMError(msg)
+
+                    choices = result.get("choices", [])
+                    if not choices:
+                        raise LLMError("Empty choices in response")
+                    text = choices[0].get("message", {}).get("content", "") or ""
+                    usage = result.get("usage", {}) or {}
+                    pt = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
+                    ct = usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
+                    return LLMResponse(text=text, prompt_tokens=pt, completion_tokens=ct)
+
+                return await asyncio.to_thread(_blocking)
+            except LLMError as e:
+                if attempt == max_retries - 1:
+                    raise
+                status_match = any(str(code) in str(e) for code in retry_statuses)
+                if not status_match:
+                    raise
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                log.warning("LLM API error (attempt %d/%d): %s — retrying in %.1fs",
+                            attempt + 1, max_retries, e, wait)
+                await asyncio.sleep(wait)
+
+    async def _streaming_complete(self, url: str, payload: dict,
+                                   headers: dict, timeout: int,
+                                   stream_callback: Callable[[str], None]) -> LLMResponse:
+        """Handle streaming response from OpenAI-compatible API."""
         def _blocking() -> LLMResponse:
-            import urllib.request
-            import urllib.error
             data = json.dumps(payload).encode("utf-8")
             req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
+                    full_text = ""
+                    for line in resp:
+                        line = line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data: "):
+                            continue
+                        if line == "data: [DONE]":
+                            break
+                        try:
+                            chunk = json.loads(line[6:])
+                            delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if delta:
+                                full_text += delta
+                                stream_callback(delta)
+                        except (json.JSONDecodeError, IndexError, KeyError):
+                            continue
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8", errors="replace")
                 try:
                     err = json.loads(body).get("error", {})
                     msg = err.get("message", str(e)) if isinstance(err, dict) else str(e)
                 except Exception:
-                    msg = f"HTTP {e.code}: {body[:300]}"
+                    msg = f"HTTP {e.code}: {body[:MAX_ERROR_PREVIEW]}"
                 raise LLMError(msg)
             except Exception as e:
-                raise LLMError(f"Request failed: {e}")
-
-            if "error" in result:
-                err = result["error"]
-                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                raise LLMError(msg)
-
-            choices = result.get("choices", [])
-            if not choices:
-                raise LLMError("Empty choices in response")
-            text = choices[0].get("message", {}).get("content", "") or ""
-            usage = result.get("usage", {}) or {}
-            pt = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
-            ct = usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
-            return LLMResponse(text=text, prompt_tokens=pt, completion_tokens=ct)
+                raise LLMError(f"Streaming request failed: {e}")
+            return LLMResponse(text=full_text)
 
         return await asyncio.to_thread(_blocking)
-
-    async def _streaming_complete(self, url: str, payload: dict,
-                                   headers: dict, timeout: int,
-                                   stream_callback: Callable[[str], None]) -> LLMResponse:
-        """Handle streaming response from OpenAI-compatible API."""
-        import urllib.request
-        import urllib.error
-
-        data = json.dumps(payload).encode("utf-8")
-        req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                full_text = ""
-                for line in resp:
-                    line = line.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data: "):
-                        continue
-                    if line == "data: [DONE]":
-                        break
-                    try:
-                        chunk = json.loads(line[6:])
-                        delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if delta:
-                            full_text += delta
-                            stream_callback(delta)
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        continue
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            try:
-                err = json.loads(body).get("error", {})
-                msg = err.get("message", str(e)) if isinstance(err, dict) else str(e)
-            except Exception:
-                msg = f"HTTP {e.code}: {body[:300]}"
-            raise LLMError(msg)
-        except Exception as e:
-            raise LLMError(f"Streaming request failed: {e}")
-
-        return LLMResponse(text=full_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1244,18 +1298,18 @@ def parse_tool_calls(text: str) -> list[dict]:
         except json.JSONDecodeError as e:
             repaired = _try_repair_json(raw_clean)
             if repaired is None:
-                calls.append({"_parse_error": str(e), "raw": raw[:300]})
+                calls.append({"_parse_error": str(e), "raw": raw[:MAX_PARSE_RAW_PREVIEW]})
                 continue
             obj = repaired
         if not isinstance(obj, dict):
-            calls.append({"_parse_error": "not a JSON object", "raw": raw[:300]})
+            calls.append({"_parse_error": "not a JSON object", "raw": raw[:MAX_PARSE_RAW_PREVIEW]})
             continue
         if "name" not in obj:
-            calls.append({"_parse_error": "missing 'name' field", "raw": raw[:300]})
+            calls.append({"_parse_error": "missing 'name' field", "raw": raw[:MAX_PARSE_RAW_PREVIEW]})
             continue
         obj.setdefault("args", {})
         if not isinstance(obj["args"], dict):
-            calls.append({"_parse_error": "'args' must be an object", "raw": raw[:300]})
+            calls.append({"_parse_error": "'args' must be an object", "raw": raw[:MAX_PARSE_RAW_PREVIEW]})
             continue
         calls.append(obj)
     return calls
@@ -1316,6 +1370,12 @@ class AgentStep:
     input_tokens: int = 0
     output_tokens: int = 0
 
+    def __str__(self) -> str:
+        name = self.tool_name or "<no-call>"
+        err = f" err={self.error}" if self.error else ""
+        tok = f" tok={self.input_tokens}+{self.output_tokens}" if self.input_tokens or self.output_tokens else ""
+        return f"Step({self.iteration}: {name}{err}{tok} {self.duration_ms}ms)"
+
 
 @dataclass
 class AgentResult:
@@ -1324,6 +1384,10 @@ class AgentResult:
     steps:        list[AgentStep]
     iterations:   int
     writes_audit: list[dict] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        status = "SUCCESS" if self.success else "FAILED"
+        return f"AgentResult({status}, {self.iterations} iters, {len(self.steps)} steps)"
 
     def to_dict(self) -> dict:
         return {
@@ -1565,15 +1629,30 @@ class FileAgent:
                  dry_run: bool = False,
                  allow_dangerous: bool = False,
                  max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
-                 require_investigation: bool = True) -> None:
+                 require_investigation: bool = True,
+                 max_context_tokens: int = 128_000) -> None:
         self.client  = client
         self.sandbox = Sandbox(root, read_only=read_only, dry_run=dry_run,
                                allow_dangerous=allow_dangerous)
         if max_iterations < 1:
             raise ValueError("max_iterations must be >= 1")
-        self.max_iterations     = max_iterations
-        self.max_result_chars   = max(1000, int(max_result_chars))
+        self.max_iterations        = max_iterations
+        self.max_result_chars      = max(1000, int(max_result_chars))
         self.require_investigation = require_investigation
+        self._max_context_tokens   = max(4000, int(max_context_tokens))
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        return len(text) // 4
+
+    def _trim_messages(self, messages: list[dict], max_tokens: int) -> list[dict]:
+        if not messages:
+            return messages
+        total = sum(self._estimate_tokens(m.get("content", "")) for m in messages)
+        while total > max_tokens and len(messages) > 3:
+            removed = messages.pop(1)
+            total -= self._estimate_tokens(removed.get("content", ""))
+        return messages
 
     def _format_result(self, result: Any) -> str:
         try:
@@ -1630,6 +1709,9 @@ class FileAgent:
             step = AgentStep(iteration=i)
 
             try:
+                system_tokens = self._estimate_tokens(system)
+                msg_budget = max(4000, self._max_context_tokens - system_tokens)
+                self._trim_messages(messages, msg_budget)
                 resp = await self.client.complete(messages, system=system,
                                                     stream_callback=stream_callback)
             except LLMError as e:
@@ -1663,7 +1745,7 @@ class FileAgent:
                 preview         = (reply or "").strip()
                 step.error      = (
                     f"no tool call ({consecutive_no_call}/{NO_CALL_SOFT_LIMIT}): "
-                    + (preview[:160].replace("\n", " ") if preview else "empty")
+                    + (preview[:MAX_ITER_PREVIEW].replace("\n", " ") if preview else "empty")
                 )
                 step.duration_ms = int((time.time() - t0) * 1000)
                 steps.append(step)
@@ -1883,27 +1965,28 @@ class _LiveStats:
     def elapsed(self) -> float:
         return time.time() - self.t_start
 
-    def _bar(self, current: int, width: int = 14) -> str:
+    def _bar(self, current: int, width: int = 28) -> str:
         frac   = max(0.0, min(1.0, current / max(1, self.max_iter)))
         filled = int(frac * width)
         return _grey("[") + _green("#" * filled) + _grey("-" * (width - filled)) + _grey("]")
 
-    def _sparkline(self, values: list[int], width: int = 8) -> str:
+    def _sparkline(self, values: list[int], width: int = 16) -> str:
         recent = values[-width:]
         if not recent:
-            return _grey("[▁▁▁▁▁▁▁▁]")
+            return _grey("[▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁]")
         mx = max(recent)
         if mx == 0:
-            return _grey("[▁▁▁▁▁▁▁▁]")
+            return _grey("[▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁ ▁]")
         n = len(self.SPARK_CHARS) - 1
         out = _grey("[")
         for v in recent:
             idx = int(v / mx * n)
             c = self.SPARK_CHARS[idx]
             out += _green(c) if idx > n // 2 else (_yellow(c) if idx > 0 else _grey(c))
+            out += " "
         pad = width - len(recent)
         if pad > 0:
-            out += _grey("▁" * pad)
+            out += _grey("▁ " * pad)
         out += _grey("]")
         return out
 
@@ -1923,7 +2006,6 @@ class _LiveStats:
         return (
             f"  {bar} {current}/{self.max_iter}"
             f"  ok{self.tools_ok}  err{self.tools_err}{nc}"
-            f"  ms{self.total_ms}"
             f"{self._fmt_tokens()}"
             f"  {_grey(es)}"
             f"  {spark}"
@@ -1967,7 +2049,7 @@ def _make_step_reporter(stats: _LiveStats, max_iter: int,
         if stats.show_thoughts:
             thought = _strip_tool_blocks(step.model_text or "")
             for ln in thought.splitlines()[:6]:
-                print(f"  {_grey('│')} {ln[:200]}", file=sys.stderr)
+                print(f"  {_grey('│')} {ln[:MAX_LINE_PREVIEW]}", file=sys.stderr)
 
         stats.update(step)
 
@@ -2065,7 +2147,7 @@ def _print_banner(root: Path, profile_name: str, model: str,
     print(f"  {_grey('Model')}   {model}", file=sys.stderr)
     print(f"  {_grey('Mode')}    {_yellow(mode)}", file=sys.stderr)
     print(f"  {_grey('MaxIter')} {max_iter}", file=sys.stderr)
-    preview = task if len(task) <= 200 else task[:200] + "…"
+    preview = task if len(task) <= MAX_TASK_PREVIEW else task[:MAX_TASK_PREVIEW] + "…"
     print(f"  {_grey('Task')}    {preview}", file=sys.stderr)
     print(sep + "\n", file=sys.stderr)
 
@@ -2085,6 +2167,11 @@ def _print_summary(result: AgentResult, stats: _LiveStats) -> None:
         f"  ms{stats.total_ms}{stats._fmt_tokens()}  {stats.elapsed():.1f}s",
         file=sys.stderr,
     )
+    dry_writes = [w for w in result.writes_audit if w.get("dry_run")]
+    if dry_writes:
+        print(f"  {_yellow('Dry-run audit')}", file=sys.stderr)
+        for w in dry_writes:
+            print(f"    {_grey(w['op'])} {_yellow('→')} {w['path']}", file=sys.stderr)
     print(sep, file=sys.stderr)
 
 
@@ -2290,7 +2377,7 @@ def handle_config_command(cmd: str, cfg: ConfigManager,
             print("  (no history)", file=sys.stderr)
         else:
             for idx, h in enumerate(hist[-20:], 1):
-                print(f"  {_grey(f'{idx:>3}.')} {h[:100]}", file=sys.stderr)
+                print(f"  {_grey(f'{idx:>3}.')} {h[:MAX_HIST_PREVIEW]}", file=sys.stderr)
         return "ok"
 
     # /quit / /exit
@@ -2412,7 +2499,7 @@ def _main() -> int:
     profile = cfg.active_profile()
 
     # ---- resolve credentials (CLI overrides profile) ----
-    api_key  = args.api_key  or profile.get("api_key",      "")
+    api_key  = args.api_key  or os.environ.get("FILE_AGENT_API_KEY", "") or profile.get("api_key", "")
     api_url  = args.api_url  or profile.get("base_url",     "https://api.openai.com/v1")
     model    = args.model    or profile.get("active_model", "")
     max_iter = args.max_iter or profile.get("max_iter",     100)
@@ -2547,7 +2634,7 @@ def _main() -> int:
                 print(_yellow("  No history yet."), file=sys.stderr)
                 continue
             task = hist[-1]
-            print(_grey(f"  Repeating: {task[:80]}"), file=sys.stderr)
+            print(_grey(f"  Repeating: {task[:MAX_REPEAT_PREVIEW]}"), file=sys.stderr)
 
         if not sandbox_root[0]:
             print(_yellow("  Set a sandbox root first: /root <path>"), file=sys.stderr)
