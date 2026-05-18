@@ -1826,7 +1826,7 @@ def _fmt_bytes(n: int) -> str:
 # ---------------------------------------------------------------------------
 
 class _LiveStats:
-    SPARK_CHARS = "▁▂▃▄▅▆▇█"
+    SPARK_CHARS = " ░▒▓█"
 
     def __init__(self, max_iter: int, *, show_stats: bool = True,
                  show_thoughts: bool = False) -> None:
@@ -1871,20 +1871,23 @@ class _LiveStats:
         filled = int(frac * width)
         return _grey("[") + _green("#" * filled) + _grey("-" * (width - filled)) + _grey("]")
 
-    def _sparkline(self, values: list[int], width: int = 10) -> str:
+    def _sparkline(self, values: list[int], width: int = 8) -> str:
         recent = values[-width:]
         if not recent:
-            return _grey("▁" * width)
+            return _grey("[       ]")
         mx = max(recent)
         if mx == 0:
-            return _grey("▁" * width)
+            return _grey("[       ]")
         n = len(self.SPARK_CHARS) - 1
-        out = ""
+        out = _grey("[")
         for v in recent:
-            out += self.SPARK_CHARS[int(v / mx * n)]
+            idx = int(v / mx * n)
+            c = self.SPARK_CHARS[idx]
+            out += _green(c) if idx > n // 2 else (_yellow(c) if idx > 0 else _grey(c))
         pad = width - len(recent)
         if pad > 0:
-            out += _grey("▁" * pad)
+            out += _grey(" " * pad)
+        out += _grey("]")
         return out
 
     def render_footer(self, current: int) -> str:
