@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import getpass
 import platform
@@ -104,9 +105,13 @@ class ConfigManager:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
-            CONFIG_FILE.chmod(0o600)
         except OSError as e:
             log.warning("Could not save config: %s", e)
+            return
+        try:
+            CONFIG_FILE.chmod(0o600)
+        except OSError:
+            pass
 
     # ---- global props ----
 
@@ -250,7 +255,7 @@ def run_wizard(cfg: ConfigManager) -> bool:
     else:
         base_url = _prompt_inline("Base URL", "https://api.openai.com/v1")
 
-    api_key = _prompt_inline("API key")
+    api_key = _prompt_inline("API key", secret=True)
     if not api_key:
         print(_yellow("  ⚠  No API key — set later with /set key <value>"), file=sys.stderr)
 
@@ -330,10 +335,10 @@ class Sandbox:
         raw = (self.root / path.lstrip("/"))
         if raw.exists() and raw.is_symlink():
             target = raw.resolve()
-            if not str(target).startswith(str(self.root)):
+            if not target.is_relative_to(self.root):
                 raise SandboxError(f"symlink escapes sandbox: {path}")
         p = raw.resolve()
-        if not str(p).startswith(str(self.root)):
+        if not p.is_relative_to(self.root):
             raise SandboxError(f"path outside sandbox: {path}")
         if must_exist and not p.exists():
             raise SandboxError(f"does not exist: {path}")
@@ -448,7 +453,7 @@ class Sandbox:
         results: list[str] = []
         root_str = str(self.root)
         for dirpath, dirnames, filenames in os.walk(root_str):
-            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
+            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS and not d.startswith(".")]
             for fname in filenames:
                 full = os.path.join(dirpath, fname)
                 rel  = os.path.relpath(full, root_str).replace(os.sep, "/")
@@ -492,13 +497,15 @@ class Sandbox:
 
     def file_info(self, path: str) -> dict:
         full = self._resolve(path, must_exist=True)
+        raw = self.root / path.lstrip("/")
+        is_symlink = raw.exists() and raw.is_symlink()
         try:
             st = full.stat()
         except OSError as e:
             raise SandboxError(f"cannot stat: {e}")
         info: dict = {
             "path": path,
-            "type": "dir" if full.is_dir() else ("symlink" if full.is_symlink() else "file"),
+            "type": "dir" if full.is_dir() else ("symlink" if is_symlink else "file"),
             "size": st.st_size if full.is_file() else None,
             "mtime": st.st_mtime, "ctime": st.st_ctime,
             "mode": oct(st.st_mode & 0o777),
@@ -671,8 +678,11 @@ class Sandbox:
             max_results = 100
         base = self._resolve(path, must_exist=True)
         matches: list[str] = []
+        max_bytes = self.MAX_READ_BYTES
         for full, rel in self._walk_text_files(base):
             try:
+                if os.path.getsize(full) > max_bytes:
+                    continue
                 with open(full, "r", encoding="utf-8", errors="ignore") as fh:
                     for line in fh:
                         if rx.search(line):
@@ -711,50 +721,24 @@ class Sandbox:
 
     def file_permissions(self, path: str, mode: str = "") -> dict:
         full = self._resolve(path, must_exist=True)
-        current_mode = oct(full.stat().st_mode & 0o777)
+        current = full.stat().st_mode & 0o777
         if not mode:
-            return {"path": path, "mode": current_mode, "changed": False}
+            return {"path": path, "mode": oct(current), "changed": False}
         self._check_write()
-        new_mode = None
         try:
-            if mode.startswith("0"):
-                new_mode = int(mode, 8)
-            elif mode.startswith(("-", "+")):
-                op = mode[0]
-                change = mode[1:]
-                who_map = {"u": 0o700, "g": 0o070, "o": 0o007, "a": 0o777}
-                mask = 0o777
-                for c in change:
-                    if c in "rwx":
-                        continue
-                    if c in "augo" and len(change) > 1:
-                        mask = who_map.get(c, 0o777)
-                        change = change.replace(c, "", 1)
-                if not change:
-                    new_mode = None
-                else:
-                    cur = full.stat().st_mode & 0o777
-                    for c in change:
-                        if c == "+":
-                            continue
-                        perms = {"r": 0o444, "w": 0o222, "x": 0o111}
-                        bit = perms.get(c)
-                        if bit is not None:
-                            if op == "-":
-                                new_mode = (cur & ~bit) & mask
-                            else:
-                                new_mode = (cur | bit) & mask
-                        else:
-                            new_mode = None
-                            break
-            else:
-                new_mode = int(mode, 8)
-            if new_mode is not None:
-                os.chmod(full, new_mode)
-                return {"path": path, "mode": oct(full.stat().st_mode & 0o777), "changed": True}
-        except (ValueError, OSError) as e:
+            new_mode = int(mode.strip(), 8)
+        except ValueError:
+            raise SandboxError(f"invalid mode: '{mode}' — use octal (e.g. '644', '755')")
+        if not (0 <= new_mode <= 0o777):
+            raise SandboxError(f"mode out of range: {mode}")
+        if self.dry_run:
+            self._audit("file_permissions", path, mode=oct(new_mode), dry_run=True)
+            return {"path": path, "mode": oct(new_mode), "changed": True, "dry_run": True}
+        try:
+            os.chmod(full, new_mode)
+        except OSError as e:
             raise SandboxError(f"cannot change permissions: {e}")
-        return {"path": path, "mode": current_mode, "changed": False}
+        return {"path": path, "mode": oct(full.stat().st_mode & 0o777), "changed": True}
 
     def file_type(self, path: str) -> dict:
         full = self._resolve(path, must_exist=True)
@@ -776,27 +760,33 @@ class Sandbox:
         is_binary = full.suffix.lower() in self.BINARY_EXTS
         return {"path": path, "suffix": suffix, "mime": mime, "is_binary": is_binary}
 
+    _SHELL_METACHAR_RE = re.compile(r'[;&|`$(){}!<>\n\\]')
+
     def run_command(self, cmd: str, cwd: str = ".", timeout: int = 30) -> dict:
         self._check_write()
-        base_cmd = shlex.split(cmd)[0] if cmd.strip() else ""
-        if base_cmd and base_cmd not in self.ALLOWED_COMMANDS:
+        if self.dry_run:
+            self._audit("run_command", cmd, cwd=cwd, dry_run=True)
+            return {"cmd": cmd, "cwd": cwd, "returncode": 0,
+                    "stdout": "", "stderr": "(dry run)", "ok": True, "dry_run": True}
+        if self._SHELL_METACHAR_RE.search(cmd):
+            raise SandboxError("shell metacharacters (;&|`$(){}!<>) are not allowed")
+        try:
+            parts = shlex.split(cmd)
+        except ValueError as e:
+            raise SandboxError(f"invalid command syntax: {e}")
+        if not parts:
+            raise SandboxError("empty command")
+        if parts[0] not in self.ALLOWED_COMMANDS:
             allowed_show = ", ".join(sorted(self.ALLOWED_COMMANDS))
-            raise SandboxError(
-                f"command '{base_cmd}' not in allowlist. Allowed: {allowed_show}"
-            )
+            raise SandboxError(f"command '{parts[0]}' not in allowlist. Allowed: {allowed_show}")
         try:
             timeout = max(1, min(int(timeout), 300))
         except (TypeError, ValueError):
             timeout = 30
         full_cwd = self._resolve(cwd, must_exist=True) if cwd != "." else self.root
-        system = platform.system()
-        if system == "Windows":
-            shell_cmd = ["cmd", "/c", cmd]
-        else:
-            shell_cmd = ["/bin/sh", "-c", cmd]
         try:
             result = subprocess.run(
-                shell_cmd, cwd=str(full_cwd),
+                parts, cwd=str(full_cwd),
                 capture_output=True, text=True, timeout=timeout
             )
             return {
@@ -805,7 +795,7 @@ class Sandbox:
                 "stdout": result.stdout[:MAX_COMMAND_OUTPUT],
                 "stderr": result.stderr[:MAX_COMMAND_OUTPUT],
                 "ok": result.returncode == 0,
-                "platform": system,
+                "platform": platform.system(),
             }
         except subprocess.TimeoutExpired:
             return {"cmd": cmd, "cwd": str(full_cwd), "returncode": -1,
@@ -1108,7 +1098,9 @@ def dispatch_tool(sandbox: Sandbox, name: str, args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 class LLMError(Exception):
-    pass
+    def __init__(self, message: str, status_code: int = 0):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass
@@ -1152,7 +1144,6 @@ class LLMClient:
 
         url     = f"{self.base_url}/chat/completions"
         timeout = self.timeout
-        import random
 
         max_retries = 3
         retry_statuses = {429, 500, 502, 503}
@@ -1175,7 +1166,7 @@ class LLMClient:
                             msg = err.get("message", str(e)) if isinstance(err, dict) else str(e)
                         except Exception:
                             msg = f"HTTP {e.code}: {body[:MAX_ERROR_PREVIEW]}"
-                        raise LLMError(msg)
+                        raise LLMError(msg, status_code=e.code)
                     except Exception as e:
                         raise LLMError(f"Request failed: {e}")
 
@@ -1197,8 +1188,7 @@ class LLMClient:
             except LLMError as e:
                 if attempt == max_retries - 1:
                     raise
-                status_match = any(str(code) in str(e) for code in retry_statuses)
-                if not status_match:
+                if e.status_code not in retry_statuses:
                     raise
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 log.warning("LLM API error (attempt %d/%d): %s — retrying in %.1fs",
@@ -1236,7 +1226,7 @@ class LLMClient:
                     msg = err.get("message", str(e)) if isinstance(err, dict) else str(e)
                 except Exception:
                     msg = f"HTTP {e.code}: {body[:MAX_ERROR_PREVIEW]}"
-                raise LLMError(msg)
+                raise LLMError(msg, status_code=e.code)
             except Exception as e:
                 raise LLMError(f"Streaming request failed: {e}")
             return LLMResponse(text=full_text)
@@ -1639,20 +1629,25 @@ class FileAgent:
         self.max_iterations        = max_iterations
         self.max_result_chars      = max(1000, int(max_result_chars))
         self.require_investigation = require_investigation
-        self._max_context_tokens   = max(4000, int(max_context_tokens))
+        if max_context_tokens > 0:
+            self._max_context_tokens = max(4000, int(max_context_tokens))
+        else:
+            detected = _model_context_window(client.model)
+            self._max_context_tokens = detected if detected > 0 else 128_000
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        return len(text) // 4
+        ascii_chars = sum(1 for c in text if ord(c) < 128)
+        non_ascii = len(text) - ascii_chars
+        return (ascii_chars // 4) + non_ascii
 
-    def _trim_messages(self, messages: list[dict], max_tokens: int) -> list[dict]:
+    def _trim_messages(self, messages: list[dict], max_tokens: int) -> None:
         if not messages:
-            return messages
+            return
         total = sum(self._estimate_tokens(m.get("content", "")) for m in messages)
         while total > max_tokens and len(messages) > 3:
             removed = messages.pop(1)
             total -= self._estimate_tokens(removed.get("content", ""))
-        return messages
 
     def _format_result(self, result: Any) -> str:
         try:
@@ -1914,7 +1909,7 @@ def _model_context_window(model: str) -> int:
     if "gpt-3" in m:         return 16384
     if "claude" in m:        return 200000
     if "deepseek" in m:      return 128000
-    if "llama" in m:         return 8192
+    if "llama" in m:         return 131072
     if "mistral" in m:       return 32768
     if "qwen" in m:          return 32768
     if "mixtral" in m:       return 32768
@@ -2323,8 +2318,9 @@ def handle_config_command(cmd: str, cfg: ConfigManager,
         if field_ == "iter":
             try:
                 n = int(value)
-                assert n > 0
-            except (ValueError, AssertionError):
+                if n <= 0:
+                    raise ValueError
+            except (ValueError, TypeError):
                 return _red("Usage: /set iter <positive_integer>")
             cfg.update_active(max_iter=n)
             return _green(f"Max iterations set to {n}.")
