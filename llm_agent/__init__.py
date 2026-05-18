@@ -1849,7 +1849,8 @@ class _LiveStats:
 
     def render_line(self, current: int) -> str:
         bar = self._bar(current)
-        return f"  {bar} {current}/{self.max_iter}  {_grey(f'{self.elapsed():.1f}s')}"
+        nc = f" ○{self.no_call_warns}" if self.no_call_warns else ""
+        return f"\r  {bar} {current}/{self.max_iter}  ok{self.tools_ok}  err{self.tools_err}{nc}  ms{self.total_ms}  {self.elapsed():.1f}s" + " " * 20
 
     def render_footer(self, current: int) -> str:
         bar  = self._bar(current)
@@ -1916,8 +1917,6 @@ def _make_step_reporter(stats: _LiveStats, max_iter: int) -> Callable[[AgentStep
             f"  {_grey(f'({step.duration_ms}ms)')}",
             file=sys.stderr,
         )
-        if stats.show_stats:
-            print(stats.render_line(step.iteration), file=sys.stderr)
 
     return _emit
 
