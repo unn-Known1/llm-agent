@@ -35,6 +35,13 @@ from typing import Any, Callable, Generator, Optional
 log = logging.getLogger(__name__)
 VERSION = "1.1.0"
 
+__all__ = [
+    "FileAgent", "AgentResult", "AgentStep",
+    "Sandbox", "SandboxError",
+    "LLMClient", "LLMError", "LLMResponse",
+    "ConfigManager", "VERSION",
+]
+
 MAX_COMMAND_OUTPUT  = 5000
 MAX_TASK_PREVIEW    = 200
 MAX_LINE_PREVIEW    = 200
@@ -283,6 +290,9 @@ class SandboxError(Exception):
     pass
 
 
+_SHELL_METACHAR_RE = re.compile(r'[;&|`$(){}!<>\n\\]')
+
+
 class Sandbox:
     MAX_DIR_ENTRIES   = 10_000
     MAX_READ_BYTES    = 10_000_000
@@ -362,7 +372,7 @@ class Sandbox:
                 yield str(base), rel
             return
         for dirpath, dirnames, filenames in os.walk(str(base)):
-            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
+            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS and not d.startswith(".")]
             for fname in filenames:
                 if os.path.splitext(fname)[1].lower() in self.BINARY_EXTS:
                     continue
@@ -760,15 +770,13 @@ class Sandbox:
         is_binary = full.suffix.lower() in self.BINARY_EXTS
         return {"path": path, "suffix": suffix, "mime": mime, "is_binary": is_binary}
 
-    _SHELL_METACHAR_RE = re.compile(r'[;&|`$(){}!<>\n\\]')
-
     def run_command(self, cmd: str, cwd: str = ".", timeout: int = 30) -> dict:
         self._check_write()
         if self.dry_run:
             self._audit("run_command", cmd, cwd=cwd, dry_run=True)
             return {"cmd": cmd, "cwd": cwd, "returncode": 0,
                     "stdout": "", "stderr": "(dry run)", "ok": True, "dry_run": True}
-        if self._SHELL_METACHAR_RE.search(cmd):
+        if _SHELL_METACHAR_RE.search(cmd):
             raise SandboxError("shell metacharacters (;&|`$(){}!<>) are not allowed")
         try:
             parts = shlex.split(cmd)
@@ -799,7 +807,7 @@ class Sandbox:
             }
         except subprocess.TimeoutExpired:
             return {"cmd": cmd, "cwd": str(full_cwd), "returncode": -1,
-                    "stdout": "", "stderr": f"Command timed out after {timeout}s", "ok": False}
+                    "stdout": "", "stderr": f"Command timed out after {timeout}s", "ok": False, "platform": platform.system()}
         except OSError as e:
             raise SandboxError(f"command failed: {e}")
 
@@ -1148,42 +1156,41 @@ class LLMClient:
         max_retries = 3
         retry_statuses = {429, 500, 502, 503}
 
+        def _blocking() -> LLMResponse:
+            data = json.dumps(payload).encode("utf-8")
+            req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")
+                try:
+                    err = json.loads(body).get("error", {})
+                    msg = err.get("message", str(e)) if isinstance(err, dict) else str(e)
+                except Exception:
+                    msg = f"HTTP {e.code}: {body[:MAX_ERROR_PREVIEW]}"
+                raise LLMError(msg, status_code=e.code)
+            except Exception as e:
+                raise LLMError(f"Request failed: {e}")
+
+            if "error" in result:
+                err = result["error"]
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                raise LLMError(msg)
+
+            choices = result.get("choices", [])
+            if not choices:
+                raise LLMError("Empty choices in response")
+            text = choices[0].get("message", {}).get("content", "") or ""
+            usage = result.get("usage", {}) or {}
+            pt = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
+            ct = usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
+            return LLMResponse(text=text, prompt_tokens=pt, completion_tokens=ct)
+
         for attempt in range(max_retries):
             try:
                 if stream_callback:
                     return await self._streaming_complete(url, payload, headers, timeout, stream_callback)
-
-                def _blocking() -> LLMResponse:
-                    data = json.dumps(payload).encode("utf-8")
-                    req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
-                    try:
-                        with urllib.request.urlopen(req, timeout=timeout) as resp:
-                            result = json.loads(resp.read().decode("utf-8"))
-                    except urllib.error.HTTPError as e:
-                        body = e.read().decode("utf-8", errors="replace")
-                        try:
-                            err = json.loads(body).get("error", {})
-                            msg = err.get("message", str(e)) if isinstance(err, dict) else str(e)
-                        except Exception:
-                            msg = f"HTTP {e.code}: {body[:MAX_ERROR_PREVIEW]}"
-                        raise LLMError(msg, status_code=e.code)
-                    except Exception as e:
-                        raise LLMError(f"Request failed: {e}")
-
-                    if "error" in result:
-                        err = result["error"]
-                        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                        raise LLMError(msg)
-
-                    choices = result.get("choices", [])
-                    if not choices:
-                        raise LLMError("Empty choices in response")
-                    text = choices[0].get("message", {}).get("content", "") or ""
-                    usage = result.get("usage", {}) or {}
-                    pt = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
-                    ct = usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
-                    return LLMResponse(text=text, prompt_tokens=pt, completion_tokens=ct)
-
                 return await asyncio.to_thread(_blocking)
             except LLMError as e:
                 if attempt == max_retries - 1:
@@ -1194,6 +1201,7 @@ class LLMClient:
                 log.warning("LLM API error (attempt %d/%d): %s — retrying in %.1fs",
                             attempt + 1, max_retries, e, wait)
                 await asyncio.sleep(wait)
+        raise LLMError("max retries exhausted without response")
 
     async def _streaming_complete(self, url: str, payload: dict,
                                    headers: dict, timeout: int,
@@ -1475,8 +1483,9 @@ file_permissions(path, mode="")
     Best for: making scripts executable, fixing permission issues.
 
 run_command(cmd, cwd=".", timeout=30)
-    → Executes a shell command in the sandbox directory.
-    Cross-platform: uses cmd /c on Windows, /bin/sh -c on Linux/macOS.
+    → Executes a command directly in the sandbox directory (no shell).
+    Shell metacharacters (;&|`$(){}<>) are blocked for safety.
+    Globs like *.py are NOT expanded — use glob() or list_dir() instead.
     Returns returncode, stdout, stderr, ok, and platform flag.
     Best for: running tests, linters, git commands, build scripts.
     WARNING: Use only when tools above cannot accomplish the task.
@@ -1560,7 +1569,7 @@ Find and understand:
 Quick code overview (FAST):
   1. grep("^(class |def |async def )", path=".") → list all classes/functions
   2. grep("import |from .* import", path=".") → find all imports
-  3. run_command("wc -l *.py") → get file sizes at a glance
+   3. glob("**/*.py") then word_count() on each → get file sizes
 
 Analyze before modifying:
   1. grep("function_name") to find all files containing it
@@ -1591,7 +1600,7 @@ EFFICIENCY GUIDELINES (follow these for faster results)
 • Pattern: For understanding codebase → grep("^(class |def |async def )", path=".")
 • Pattern: For finding files with patterns → glob("**/*.py") then grep on specific files
 • Avoid sequential chunked reads — use search/grep for overview first
-• Batch related operations: use run_command("grep -r 'pattern' .") instead of multiple reads
+• Batch related operations: use grep("pattern", path=".") instead of multiple reads
 • Re-read files only if content changed; avoid redundant reads for same data
 
 ═══════════════════════════════════════════════════════════════
@@ -1620,7 +1629,7 @@ class FileAgent:
                  allow_dangerous: bool = False,
                  max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
                  require_investigation: bool = True,
-                 max_context_tokens: int = 128_000) -> None:
+                 max_context_tokens: int = 0) -> None:
         self.client  = client
         self.sandbox = Sandbox(root, read_only=read_only, dry_run=dry_run,
                                allow_dangerous=allow_dangerous)
@@ -1637,9 +1646,9 @@ class FileAgent:
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        ascii_chars = sum(1 for c in text if ord(c) < 128)
-        non_ascii = len(text) - ascii_chars
-        return (ascii_chars // 4) + non_ascii
+        ascii_count = len(text.encode("ascii", errors="ignore"))
+        non_ascii = len(text) - ascii_count
+        return (ascii_count // 4) + non_ascii
 
     def _trim_messages(self, messages: list[dict], max_tokens: int) -> None:
         if not messages:
