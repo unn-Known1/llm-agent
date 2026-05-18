@@ -1626,7 +1626,6 @@ class FileAgent:
         last_successful_tool: Optional[str] = None
 
         for i in range(1, self.max_iterations + 1):
-            log.info("iteration %d/%d", i, self.max_iterations)
             t0   = time.time()
             step = AgentStep(iteration=i)
 
@@ -1895,7 +1894,7 @@ class _LiveStats:
         spark = self._sparkline(self.iter_durations)
         es = f"{self.elapsed():.1f}s"
         return (
-            f"\r  {bar} {current}/{self.max_iter}"
+            f"  {bar} {current}/{self.max_iter}"
             f"  ok{self.tools_ok}  err{self.tools_err}{nc}"
             f"  ms{self.total_ms}"
             f"{t}"
@@ -1905,14 +1904,6 @@ class _LiveStats:
         )
 
 
-class _LineTracker:
-    def __init__(self) -> None:
-        self.lines_since_footer = 0
-
-    def reset(self) -> None:
-        self.lines_since_footer = 0
-
-
 _TOOL_STRIP_RE = re.compile(r"```(?:tool|tool_call|tool_use)\s*\n.*?\n```", re.DOTALL | re.IGNORECASE)
 
 
@@ -1920,24 +1911,20 @@ def _strip_tool_blocks(text: str) -> str:
     return _TOOL_STRIP_RE.sub("", text or "").strip()
 
 
-def _make_stream_callback(linetracker: _LineTracker) -> Callable[[str], None]:
+def _make_stream_callback() -> Callable[[str], None]:
     sys.stderr.write(_grey("\n  "))
-    linetracker.lines_since_footer += 1
     sys.stderr.flush()
     def _stream(token: str) -> None:
         sys.stderr.write(token)
-        linetracker.lines_since_footer += token.count("\n")
         sys.stderr.flush()
     return _stream
 
 
-def _make_step_reporter(stats: _LiveStats, max_iter: int,
-                         linetracker: _LineTracker | None = None
-                         ) -> Callable[[AgentStep], None]:
-    _emitted = False
+def _make_step_reporter(stats: _LiveStats, max_iter: int) -> Callable[[AgentStep], None]:
+    first = True
 
     def _emit(step: AgentStep) -> None:
-        nonlocal _emitted
+        nonlocal first
         if stats.show_thoughts:
             thought = _strip_tool_blocks(step.model_text or "")
             for ln in thought.splitlines()[:6]:
@@ -1971,13 +1958,9 @@ def _make_step_reporter(stats: _LiveStats, max_iter: int,
 
         counter = _bold(f"[{step.iteration:>2}/{max_iter}]")
 
-        # Sticky footer handling
-        if _emitted and linetracker is not None and linetracker.lines_since_footer > 0:
-            sys.stderr.write(f"\033[{linetracker.lines_since_footer}A\033[J")
-            linetracker.reset()
-        elif _emitted:
+        if not first:
             sys.stderr.write("\r\033[K")
-        _emitted = True
+        first = False
 
         print(
             f"  {counter} {marker} {name}({', '.join(arg_keys)}){hint}{t}{detail}"
@@ -2434,11 +2417,10 @@ def _main() -> int:
 
         stats    = _LiveStats(max_iter, show_stats=not args.no_stats,
                               show_thoughts=args.show_thoughts)
-        linetracker = _LineTracker()
-        callback = None if args.quiet else _make_step_reporter(stats, max_iter, linetracker)
+        callback = None if args.quiet else _make_step_reporter(stats, max_iter)
         stream_cb = None
         if not args.no_stream and not args.quiet:
-            stream_cb = _make_stream_callback(linetracker)
+            stream_cb = _make_stream_callback()
 
         try:
             result = asyncio.run(agent.run(task, on_step=callback, stream_callback=stream_cb))
