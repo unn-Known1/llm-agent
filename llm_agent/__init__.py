@@ -741,14 +741,20 @@ class Sandbox:
     def run_command(self, cmd: str, cwd: str = ".", timeout: int = 30) -> dict:
         self._check_write()
         import subprocess
+        import platform
         try:
             timeout = max(1, min(int(timeout), 300))
         except (TypeError, ValueError):
             timeout = 30
         full_cwd = self._resolve(cwd, must_exist=True) if cwd != "." else self.root
+        system = platform.system()
+        if system == "Windows":
+            shell_cmd = ["cmd", "/c", cmd]
+        else:
+            shell_cmd = ["/bin/sh", "-c", cmd]
         try:
             result = subprocess.run(
-                cmd, shell=True, cwd=str(full_cwd),
+                shell_cmd, cwd=str(full_cwd),
                 capture_output=True, text=True, timeout=timeout
             )
             return {
@@ -757,6 +763,7 @@ class Sandbox:
                 "stdout": result.stdout[:5000],
                 "stderr": result.stderr[:5000],
                 "ok": result.returncode == 0,
+                "platform": system,
             }
         except subprocess.TimeoutExpired:
             return {"cmd": cmd, "cwd": str(full_cwd), "returncode": -1,
@@ -1402,7 +1409,8 @@ file_permissions(path, mode="")
 
 run_command(cmd, cwd=".", timeout=30)
     → Executes a shell command in the sandbox directory.
-    Returns returncode, stdout, stderr, and ok flag.
+    Cross-platform: uses cmd /c on Windows, /bin/sh -c on Linux/macOS.
+    Returns returncode, stdout, stderr, ok, and platform flag.
     Best for: running tests, linters, git commands, build scripts.
     WARNING: Use only when tools above cannot accomplish the task.
     timeout max: 300 seconds.
@@ -1492,7 +1500,7 @@ Run tests/builds:
   1. run_command("pytest") to run tests
   2. run_command("npm build") to build project
   3. run_command("git status") to check git state
-  4. run_command("ls -la") for detailed directory listing
+  4. run_command("ls -la")  # dir on Windows, ls -la on Linux/macOS
 
 Fix permissions:
   1. file_permissions("script.sh") to see current mode
