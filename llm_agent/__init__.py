@@ -1069,6 +1069,13 @@ class LLMError(Exception):
     pass
 
 
+@dataclass
+class LLMResponse:
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class LLMClient:
     """Async OpenAI-compatible client. Sends full conversation history each turn."""
 
@@ -1081,8 +1088,8 @@ class LLMClient:
 
     async def complete(self, messages: list[dict], system: str = "",
                        model: Optional[str] = None,
-                       stream_callback: Optional[Callable[[str], None]] = None) -> str:
-        """Returns assistant reply text. Raises LLMError on failure.
+                       stream_callback: Optional[Callable[[str], None]] = None) -> LLMResponse:
+        """Returns LLMResponse with text + token counts. Raises LLMError on failure.
         If stream_callback is provided, enables streaming mode."""
         model = model or self.model
         payload_messages: list[dict] = []
@@ -1107,7 +1114,7 @@ class LLMClient:
         if stream_callback:
             return await self._streaming_complete(url, payload, headers, timeout, stream_callback)
 
-        def _blocking() -> str:
+        def _blocking() -> LLMResponse:
             import urllib.request
             import urllib.error
             data = json.dumps(payload).encode("utf-8")
@@ -1134,13 +1141,17 @@ class LLMClient:
             choices = result.get("choices", [])
             if not choices:
                 raise LLMError("Empty choices in response")
-            return choices[0].get("message", {}).get("content", "") or ""
+            text = choices[0].get("message", {}).get("content", "") or ""
+            usage = result.get("usage", {}) or {}
+            pt = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
+            ct = usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
+            return LLMResponse(text=text, prompt_tokens=pt, completion_tokens=ct)
 
         return await asyncio.to_thread(_blocking)
 
     async def _streaming_complete(self, url: str, payload: dict,
                                    headers: dict, timeout: int,
-                                   stream_callback: Callable[[str], None]) -> str:
+                                   stream_callback: Callable[[str], None]) -> LLMResponse:
         """Handle streaming response from OpenAI-compatible API."""
         import urllib.request
         import urllib.error
@@ -1176,7 +1187,7 @@ class LLMClient:
         except Exception as e:
             raise LLMError(f"Streaming request failed: {e}")
 
-        return full_text
+        return LLMResponse(text=full_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1302,6 +1313,8 @@ class AgentStep:
     tool_result_summary: Any = None   # lightweight copy for callers
     error:       Optional[str] = None
     duration_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass
@@ -1618,7 +1631,7 @@ class FileAgent:
             step = AgentStep(iteration=i)
 
             try:
-                reply = await self.client.complete(messages, system=system,
+                resp = await self.client.complete(messages, system=system,
                                                     stream_callback=stream_callback)
             except LLMError as e:
                 step.error       = f"LLM error: {e}"
@@ -1633,6 +1646,9 @@ class FileAgent:
                     writes_audit=self.sandbox.writes_audit(),
                 )
 
+            reply = resp.text
+            step.input_tokens = resp.prompt_tokens
+            step.output_tokens = resp.completion_tokens
             step.model_text = reply
             # Add assistant reply to history
             messages.append({"role": "assistant", "content": reply})
@@ -1811,6 +1827,8 @@ def _fmt_bytes(n: int) -> str:
 # ---------------------------------------------------------------------------
 
 class _LiveStats:
+    SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
     def __init__(self, max_iter: int, *, show_stats: bool = True,
                  show_thoughts: bool = False) -> None:
         self.max_iter      = max_iter
@@ -1822,10 +1840,17 @@ class _LiveStats:
         self.no_call_warns = 0
         self.bytes_in      = 0
         self.total_ms      = 0
+        self.total_tokens  = 0
         self.tool_counts: dict[str, int] = {}
+        self.iter_durations: list[int] = []
+        self.iter_tokens: list[int] = []
 
     def update(self, step: AgentStep) -> None:
         self.total_ms += step.duration_ms or 0
+        self.total_tokens += step.input_tokens + step.output_tokens
+        if step.iteration > 0:
+            self.iter_durations.append(step.duration_ms or 0)
+            self.iter_tokens.append(step.input_tokens + step.output_tokens)
         is_no_call     = bool(step.error and step.error.startswith("no tool call"))
         if is_no_call:
             self.no_call_warns += 1
@@ -1842,27 +1867,50 @@ class _LiveStats:
     def elapsed(self) -> float:
         return time.time() - self.t_start
 
-    def _bar(self, current: int, width: int = 18) -> str:
+    def _bar(self, current: int, width: int = 14) -> str:
         frac   = max(0.0, min(1.0, current / max(1, self.max_iter)))
         filled = int(frac * width)
         return _grey("[") + _green("#" * filled) + _grey("-" * (width - filled)) + _grey("]")
 
-    def render_line(self, current: int) -> str:
-        bar = self._bar(current)
-        nc = f" ○{self.no_call_warns}" if self.no_call_warns else ""
-        return f"\r  {bar} {current}/{self.max_iter}  ok{self.tools_ok}  err{self.tools_err}{nc}  ms{self.total_ms}  {self.elapsed():.1f}s" + " " * 20
+    def _sparkline(self, values: list[int], width: int = 10) -> str:
+        recent = values[-width:]
+        if not recent:
+            return _grey("▁" * width)
+        mx = max(recent)
+        if mx == 0:
+            return _grey("▁" * width)
+        n = len(self.SPARK_CHARS) - 1
+        out = ""
+        for v in recent:
+            out += self.SPARK_CHARS[int(v / mx * n)]
+        pad = width - len(recent)
+        if pad > 0:
+            out += _grey("▁" * pad)
+        return out
 
     def render_footer(self, current: int) -> str:
-        bar  = self._bar(current)
-        parts = [
-            f"  {bar} [{current}/{self.max_iter}]",
-            f"{_green('ok')}{self.tools_ok}",
-            f"{_red('err')}{self.tools_err}",
-            f"{_yellow('○')}{self.no_call_warns}" if self.no_call_warns else "",
-            f"{_bold('ms')} {self.total_ms}",
-            f"{_grey(f'elapsed {self.elapsed():.1f}s')}",
-        ]
-        return "  ".join(p for p in parts if p)
+        bar = self._bar(current)
+        nc = f" ○{self.no_call_warns}" if self.no_call_warns else ""
+        t = f"  tok{self.total_tokens}" if self.total_tokens else ""
+        spark = self._sparkline(self.iter_durations)
+        es = f"{self.elapsed():.1f}s"
+        return (
+            f"\r  {bar} {current}/{self.max_iter}"
+            f"  ok{self.tools_ok}  err{self.tools_err}{nc}"
+            f"  ms{self.total_ms}"
+            f"{t}"
+            f"  {_grey(es)}"
+            f"  {spark}"
+            "  "
+        )
+
+
+class _LineTracker:
+    def __init__(self) -> None:
+        self.lines_since_footer = 0
+
+    def reset(self) -> None:
+        self.lines_since_footer = 0
 
 
 _TOOL_STRIP_RE = re.compile(r"```(?:tool|tool_call|tool_use)\s*\n.*?\n```", re.DOTALL | re.IGNORECASE)
@@ -1872,17 +1920,24 @@ def _strip_tool_blocks(text: str) -> str:
     return _TOOL_STRIP_RE.sub("", text or "").strip()
 
 
-def _make_stream_callback() -> Callable[[str], None]:
+def _make_stream_callback(linetracker: _LineTracker) -> Callable[[str], None]:
     sys.stderr.write(_grey("\n  "))
+    linetracker.lines_since_footer += 1
     sys.stderr.flush()
     def _stream(token: str) -> None:
         sys.stderr.write(token)
+        linetracker.lines_since_footer += token.count("\n")
         sys.stderr.flush()
     return _stream
 
 
-def _make_step_reporter(stats: _LiveStats, max_iter: int) -> Callable[[AgentStep], None]:
+def _make_step_reporter(stats: _LiveStats, max_iter: int,
+                         linetracker: _LineTracker | None = None
+                         ) -> Callable[[AgentStep], None]:
+    _emitted = False
+
     def _emit(step: AgentStep) -> None:
+        nonlocal _emitted
         if stats.show_thoughts:
             thought = _strip_tool_blocks(step.model_text or "")
             for ln in thought.splitlines()[:6]:
@@ -1910,13 +1965,27 @@ def _make_step_reporter(stats: _LiveStats, max_iter: int) -> Callable[[AgentStep
             elif "total_lines" in r: hint = f"  → {r['total_lines']} lines"
             elif "bytes" in r and r.get("bytes") is not None:
                 hint = f"  → {_fmt_bytes(int(r['bytes']))}"
+        t = ""
+        if step.input_tokens or step.output_tokens:
+            t = f"  tok{step.input_tokens}+{step.output_tokens}"
 
         counter = _bold(f"[{step.iteration:>2}/{max_iter}]")
+
+        # Sticky footer handling
+        if _emitted and linetracker is not None and linetracker.lines_since_footer > 0:
+            sys.stderr.write(f"\033[{linetracker.lines_since_footer}A\033[J")
+            linetracker.reset()
+        elif _emitted:
+            sys.stderr.write("\r\033[K")
+        _emitted = True
+
         print(
-            f"  {counter} {marker} {name}({', '.join(arg_keys)}){hint}{detail}"
+            f"  {counter} {marker} {name}({', '.join(arg_keys)}){hint}{t}{detail}"
             f"  {_grey(f'({step.duration_ms}ms)')}",
             file=sys.stderr,
         )
+        sys.stderr.write(stats.render_footer(step.iteration))
+        sys.stderr.flush()
 
     return _emit
 
@@ -1985,10 +2054,11 @@ def _print_summary(result: AgentResult, stats: _LiveStats) -> None:
         print(f"  {_red('FAILED')} after {result.iterations} iteration(s)", file=sys.stderr)
     if result.summary:
         print(f"  {_grey('Summary')}  {result.summary}", file=sys.stderr)
-    nc = f"  {_yellow('○')} {stats.no_call_warns}" if stats.no_call_warns else ""
+    nc = f"  ○{stats.no_call_warns}" if stats.no_call_warns else ""
+    t = f"  tok{stats.total_tokens}" if stats.total_tokens else ""
     print(
-        f"  {_grey('Stats')}  ok{stats.tools_ok}  err{stats.tools_err}{nc}  "
-        f"ms{stats.total_ms}  {stats.elapsed():.1f}s",
+        f"  {_grey('Stats')}  ok{stats.tools_ok}  err{stats.tools_err}{nc}"
+        f"  ms{stats.total_ms}{t}  {stats.elapsed():.1f}s",
         file=sys.stderr,
     )
     print(sep, file=sys.stderr)
@@ -2364,10 +2434,11 @@ def _main() -> int:
 
         stats    = _LiveStats(max_iter, show_stats=not args.no_stats,
                               show_thoughts=args.show_thoughts)
-        callback = None if args.quiet else _make_step_reporter(stats, max_iter)
+        linetracker = _LineTracker()
+        callback = None if args.quiet else _make_step_reporter(stats, max_iter, linetracker)
         stream_cb = None
         if not args.no_stream and not args.quiet:
-            stream_cb = _make_stream_callback()
+            stream_cb = _make_stream_callback(linetracker)
 
         try:
             result = asyncio.run(agent.run(task, on_step=callback, stream_callback=stream_cb))
