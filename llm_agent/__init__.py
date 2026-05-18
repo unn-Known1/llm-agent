@@ -1947,7 +1947,8 @@ def _strip_tool_blocks(text: str) -> str:
 
 
 def _make_stream_callback(tracker: _LineTracker) -> Callable[[str], None]:
-    sys.stderr.write(_grey("\n  "))
+    sys.stderr.write("\n")
+    sys.stderr.write(_grey("  "))
     tracker.lines += 1
     sys.stderr.flush()
     def _stream(token: str) -> None:
