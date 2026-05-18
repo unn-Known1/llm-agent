@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-agent"
+version = "1.0.0"
+description = "Autonomous AI agent for file system operations powered by any LLM API"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "unn-Known1", email = "agent@llm-agent.dev"}]
+keywords = ["ai", "llm", "openai", "autonomous-agent", "cli", "file-agent", "ollama"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Systems Administration",
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+llm-agent = "llm_agent:_main"
+
+[project.urls]
+Homepage = "https://github.com/unn-Known1/llm-agent"
+Repository = "https://github.com/unn-Known1/llm-agent"
+Issues = "https://github.com/unn-Known1/llm-agent/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_agent*"]

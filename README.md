@@ -26,35 +26,37 @@ Built on top of any OpenAI-compatible API (OpenAI, Ollama, LM Studio, vLLM, Groq
 ## Installation
 
 ```bash
-pip install llm-agent
-```
-
-Or clone and run directly:
-
-```bash
 git clone https://github.com/unn-Known1/llm-agent.git
 cd llm-agent
 pip install -e .
 ```
 
+Then run:
+
+```bash
+llm-agent              # Interactive REPL
+llm-agent "task here"   # One-shot mode
+llm-agent --help        # Show all options
+```
+
 ## Quick Start
 
 ```bash
-# Run interactively (prompt for API key, model, root)
-python llm-agent.py
+# Interactive REPL (first time: configure via /set commands)
+llm-agent
 
 # One-shot mode
-python llm-agent.py "Find all TODO comments and summarize them" --root ./myproject
+llm-agent "Find all TODO comments and summarize them" --root ./myproject
 
-# With streaming and verbose output
-python llm-agent.py "Refactor all database queries to use transactions" --root ./backend --verbose
+# With verbose output
+llm-agent "Refactor all database queries to use transactions" --root ./backend --verbose
 ```
 
 ## Configuration
 
 ```bash
 # Interactive REPL
-python llm-agent.py
+llm-agent
 
 # Set up your profile
 /set key sk-your-api-key
@@ -94,7 +96,7 @@ python llm-agent.py
 ## Command Reference
 
 ```bash
-python llm-agent.py [task] [flags]
+llm-agent [task] [flags]
 
 Flags:
   --root, -r <path>         Set sandbox root directory
