@@ -1996,13 +1996,12 @@ def _make_step_reporter(stats: _LiveStats, max_iter: int,
 
         counter = _bold(f"[{step.iteration:>2}/{max_iter}]")
 
-        if first:
-            first = False
-        elif tracker.lines > 0:
+        if tracker.lines > 0:
             sys.stderr.write(f"\033[{tracker.lines}A\033[J")
             tracker.reset()
-        else:
+        elif not first:
             sys.stderr.write("\r\033[K")
+        first = False
 
         print(
             f"  {counter} {marker} {name}({', '.join(arg_keys)}){hint}{t}{detail}"
