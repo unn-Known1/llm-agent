@@ -3,6 +3,10 @@
 .file_agent_history
 .gitconfig
 
+# Duplicate / old files (do NOT sync)
+agent6.py
+agent7.py
+
 # Python
 __pycache__/
 *.py[cod]
