@@ -148,6 +148,36 @@ User Task → LLM (GPT-4o / Ollama / etc.)
 
 The agent maintains full conversation history across turns, giving the model complete visibility of all prior tool calls and results — not just the last one.
 
+## Test
+
+```
+────────────────────────────────────────────────────────────
+  File Agent v1.0.0  profile: First
+────────────────────────────────────────────────────────────
+  Root    /content/llm-agent
+  Model   google/gemma-3n-e4b-it
+  Mode    READ_WRITE
+  MaxIter 1000
+  Task    analysis this folder
+────────────────────────────────────────────────────────────
+
+     [ 1/1000] ✓ tree(path, max_depth, show_hidden, max_entries)  → 4 entries  (3156ms)
+  [  [ 2/1000] ✓ list_dir(path)  → 3 entries  (1801ms)
+  [  [ 3/1000] ✓ read_file(path, start_line, end_line)  → 166 lines  (3244ms)
+  [  [ 4/1000] ✓ search(pattern, path)  → 3 entries  (2130ms)
+  [  [ 5/1000] ✓ read_file(path, start_line, end_line)  → 2570 lines  (3409ms)
+  [  [ 6/1000] ✓ grep(pattern, path)  → 2 entries  (2127ms)
+  [  [ 7/1000] ✓ grep(pattern, path)  → 1 entries  (2168ms)
+  [  [ 8/1000] ✓ grep(pattern, path)  → 1 entries  (2077ms)
+  [  [ 9/1000] ✓ done(summary)  (2492ms)
+  [--------------] 9/1000  ok9  err0  ms22604  22.6s  [▄▇▅█▅▅▅▆]  
+────────────────────────────────────────────────────────────
+  SUCCESS after 9 iteration(s)
+  Summary  Completed analysis: Found TODO, FIXME, and XXX comments in the codebase.
+  Stats  ok9  err0  ms22604  22.6s
+────────────────────────────────────────────────────────────
+```
+
 ## Supported APIs
 
 Works with any **OpenAI-compatible API endpoint**:
